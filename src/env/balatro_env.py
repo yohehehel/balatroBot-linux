@@ -1,6 +1,7 @@
 import gymnasium as gym
 import numpy as np
 import logging
+import time
 from typing import Dict, Any, Tuple, Optional
 
 from src.client import BalatroClient, BalatroAPIError
@@ -13,7 +14,7 @@ logger = logging.getLogger("BalatroEnv")
 class BalatroEnv(gym.Env):
     metadata = {"render_modes": []}
 
-    def __init__(self, base_url: str = "http://127.0.0.1:12346", timeout: float = 10.0):
+    def __init__(self, base_url: str = "http://127.0.0.1:12346", timeout: float = 30.0):
         super().__init__()
         self.client = BalatroClient(base_url=base_url, timeout=timeout)
         
@@ -25,9 +26,15 @@ class BalatroEnv(gym.Env):
         self.current_state: Optional[GameState] = None
         self.invalid_actions_in_a_row = 0
         self.max_invalid_actions = 20
+        self._step_count = 0
+        self._env_id = base_url.split(":")[-1]  # port number for logging
 
     def _auto_skip_boosters(self, state: GameState) -> GameState:
-        """Automatically skip booster pack selection to prevent the environment from getting stuck."""
+        """Automatically skip booster pack selection to prevent the environment from getting stuck.
+        
+        Handles timing race conditions where the pack may have already auto-closed
+        between the time the gamestate was reported and the time we call pack(skip=True).
+        """
         booster_states = {
             "SMODS_BOOSTER_OPENED",
             "TAROT_PACK",
@@ -36,19 +43,56 @@ class BalatroEnv(gym.Env):
             "STANDARD_PACK",
             "BUFFOON_PACK",
         }
-        while state.state in booster_states:
-            logger.info(f"Booster pack screen detected ({state.state}). Automatically skipping booster pack...")
+        max_retries = 5
+        retries = 0
+        while state.state in booster_states and retries < max_retries:
+            retries += 1
+
+            # Verify pack is actually present in gamestate data.
+            # With fast game speed, the pack may have already auto-closed
+            # even though the state name still indicates a booster state.
+            if not state.pack or not state.pack.cards:
+                logger.info(
+                    f"Booster state '{state.state}' reported but no pack cards "
+                    f"present in gamestate. Refreshing gamestate..."
+                )
+                try:
+                    state = self.client.gamestate()
+                except Exception as e:
+                    logger.error(f"Failed to refresh gamestate: {e}")
+                    break
+                continue
+
+            logger.info(
+                f"Booster pack screen detected ({state.state}, "
+                f"{len(state.pack.cards)} cards). Automatically skipping..."
+            )
             try:
                 state = self.client.pack(skip=True)
+            except BalatroAPIError as e:
+                if e.data and isinstance(e.data, dict) and e.data.get("name") == "INVALID_STATE":
+                    # Pack already closed between state check and API call (race condition).
+                    # Refresh gamestate and let the while loop re-evaluate.
+                    logger.warning(
+                        f"Pack already closed (INVALID_STATE). Refreshing gamestate..."
+                    )
+                    try:
+                        state = self.client.gamestate()
+                    except Exception as inner_e:
+                        logger.error(f"Failed to refresh gamestate: {inner_e}")
+                        break
+                else:
+                    logger.error(f"Failed to skip booster pack: {e}")
+                    break
             except Exception as e:
                 logger.error(f"Failed to skip booster pack: {e}")
                 break
         return state
 
     def reset(self, seed: Optional[int] = None, options: Optional[dict] = None) -> Tuple[Dict[str, np.ndarray], dict]:
-        import time
         super().reset(seed=seed)
         self.invalid_actions_in_a_row = 0
+        self._step_count = 0
         
         max_attempts = 3
         for attempt in range(1, max_attempts + 1):
@@ -87,9 +131,17 @@ class BalatroEnv(gym.Env):
         if self.current_state is None:
             raise RuntimeError("Environment must be reset before step can be called.")
 
+        self._step_count += 1
+        t_start = time.monotonic()
+
         state = self.current_state
         action_dict, is_valid = decode_action(action, state)
         action_type = action_dict.get("action", "wait")
+        
+        logger.debug(
+            f"[env:{self._env_id}] step {self._step_count}: "
+            f"state={state.state}, action={action_type}"
+        )
         
         reward = 0.0
         terminated = False
@@ -104,6 +156,7 @@ class BalatroEnv(gym.Env):
             if self.invalid_actions_in_a_row >= self.max_invalid_actions:
                 logger.warning(f"Too many invalid actions in a row ({self.invalid_actions_in_a_row}). Truncating episode.")
                 truncated = True
+                reward = -5.0  # Same penalty as GAME OVER (loss) to prevent exploit
         else:
             self.invalid_actions_in_a_row = 0
             
@@ -152,6 +205,13 @@ class BalatroEnv(gym.Env):
             # Calculate reward
             reward = self._calculate_reward(state, new_state)
             
+            dt = time.monotonic() - t_start
+            if dt > 5.0:
+                logger.warning(
+                    f"[env:{self._env_id}] step {self._step_count} slow: "
+                    f"{action_type} took {dt:.1f}s (state: {state.state} -> {new_state.state})"
+                )
+            
         # Update current state
         self.current_state = new_state
         obs = encode_observation(new_state)
@@ -179,7 +239,7 @@ class BalatroEnv(gym.Env):
             reward += 1.0
             
         # 2. Score progression (Reward for playing cards that increase score)
-        if old_state.state == "SELECTING_HAND" and new_state.state == "SELECTING_HAND":
+        if old_state.state == "SELECTING_HAND" and new_state.state in ("SELECTING_HAND", "ROUND_EVAL"):
             target_score = 0
             for blind in old_state.blinds.values():
                 if blind.status == "CURRENT":
@@ -188,8 +248,10 @@ class BalatroEnv(gym.Env):
             
             if target_score > 0:
                 score_diff = new_state.round.chips - old_state.round.chips
-                # Reward is proportional to the fraction of blind completed
-                reward += max(0.0, float(score_diff) / target_score)
+                if score_diff > 0:
+                    ratio = float(score_diff) / target_score
+                    # Quadratic reward to heavily incentivize higher scoring hands (e.g. 300 chips in 1 hand vs 100+100+100)
+                    reward += ratio + 2.0 * (ratio ** 2)
                 
         # 3. Ante progression (Defeating Boss Blind of current Ante)
         if int(new_state.ante_num) > int(old_state.ante_num):

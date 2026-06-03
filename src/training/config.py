@@ -5,12 +5,12 @@ from dataclasses import dataclass
 class TrainingConfig:
     # PPO Hyperparameters
     learning_rate: float = 3e-4
-    n_steps: int = 2048
-    batch_size: int = 64
+    n_steps: int = 4096
+    batch_size: int = 256
     n_epochs: int = 10
     gamma: float = 0.99
     clip_range: float = 0.2
-    ent_coef: float = 0.01
+    ent_coef: float = 0.005
     
     # Training Loop Settings
     total_timesteps: int = 200_000

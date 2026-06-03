@@ -73,13 +73,23 @@ def main():
 
     logger.info(f"Active Balatro instance(s) detected: {api_urls}")
 
-    # Helper function to create an env
+    # Helper function to create an env with logging configured
     def make_env(url):
         def _init():
+            # Ensure logging is configured in subprocess workers
+            import logging as _logging
+            if not _logging.getLogger().handlers:
+                _logging.basicConfig(
+                    level=_logging.INFO,
+                    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+                    handlers=[_logging.StreamHandler()],
+                )
             return Monitor(BalatroEnv(base_url=url))
         return _init
 
     if len(api_urls) > 1:
+        # Use SubprocVecEnv for true parallelism across processes.
+        # Note: env logs are configured in _init() above so they show in subprocess stderr.
         logger.info(f"Initializing SubprocVecEnv with {len(api_urls)} parallel environments...")
         env = SubprocVecEnv([make_env(url) for url in api_urls])
     else:
