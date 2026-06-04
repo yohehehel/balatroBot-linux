@@ -40,7 +40,7 @@ def main():
         print("Launching Balatro in VISIBLE FAST mode (10x game speed, window visible)...")
         env["BALATROBOT_HEADLESS"] = "0"
         # Render on API mode only draws frames when requests are received, reducing GPU load
-        env["BALATROBOT_RENDER_ON_API"] = "1"
+        env["BALATROBOT_RENDER_ON_API"] = "0"
 
     try:
         # Start Balatro process

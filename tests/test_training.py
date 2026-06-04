@@ -6,7 +6,9 @@ from src.utils.metrics import BalatroMetricsCallback
 def test_training_config_defaults():
     config = TrainingConfig()
     assert config.learning_rate == 3e-4
-    assert config.n_steps == 2048
+    assert config.n_steps == 4096
+    assert config.batch_size == 256
+    assert config.ent_coef == 0.01
     assert config.device == "auto"
 
 def test_training_config_to_ppo_kwargs():

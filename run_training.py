@@ -51,6 +51,8 @@ def main():
     parser.add_argument("--learning-rate", type=float, default=None, help="Override PPO learning rate.")
     parser.add_argument("--ent-coef", type=float, default=None, help="Override entropy coefficient.")
     parser.add_argument("--device", type=str, default=None, help="Override target device (cpu/cuda/auto).")
+    parser.add_argument("--deck", type=str, default="YELLOW", help="Deck to use for training. Default: YELLOW.")
+    parser.add_argument("--stake", type=str, default="WHITE", help="Stake level. Default: WHITE.")
     args = parser.parse_args()
 
     balatro_exe = Path(r"c:\Users\Thomas\Desktop\python\balatroBot\Balatro.v1.0.0i\Balatro.exe")
@@ -159,6 +161,8 @@ def main():
         cmd.extend(["--ent-coef", str(args.ent_coef)])
     if args.device:
         cmd.extend(["--device", args.device])
+    cmd.extend(["--deck", args.deck])
+    cmd.extend(["--stake", args.stake])
 
     try:
         # Use python from active virtualenv if present

@@ -10,12 +10,40 @@ from src.game_state import GameState
 # 3: SKIP_BLIND
 # 4: CASH_OUT
 # 5: NEXT_ROUND
+# --- Phase 2: Shop & Booster actions ---
+# 6: BUY_CARD       (buy shop card at index from card_mask)
+# 7: BUY_VOUCHER    (buy voucher at index from card_mask)
+# 8: BUY_PACK       (buy pack at index from card_mask)
+# 9: REROLL_SHOP    (reroll shop items)
+# 10: SELL_JOKER    (sell joker at index from card_mask)
+# 11: PACK_SELECT   (select card from opened booster pack)
+# 12: PACK_SKIP     (skip opened booster pack)
+
+BOOSTER_STATES = {
+    "SMODS_BOOSTER_OPENED",
+    "TAROT_PACK",
+    "PLANET_PACK",
+    "SPECTRAL_PACK",
+    "STANDARD_PACK",
+    "BUFFOON_PACK",
+}
 
 def get_action_space() -> spaces.MultiDiscrete:
     # 9 discrete dimensions:
-    # Dim 0: action type (0 to 5)
+    # Dim 0: action type (0 to 12)
     # Dim 1 to 8: binary selection of cards (0: off, 1: on)
-    return spaces.MultiDiscrete([6, 2, 2, 2, 2, 2, 2, 2, 2])
+    return spaces.MultiDiscrete([13, 2, 2, 2, 2, 2, 2, 2, 2])
+
+
+def _first_set_bit(card_mask: np.ndarray, max_idx: int = 7) -> int:
+    """Return the index of the first set bit in card_mask, clamped to max_idx.
+    Returns 0 if no bit is set.
+    """
+    for i in range(min(len(card_mask), max_idx + 1)):
+        if card_mask[i] == 1:
+            return i
+    return 0
+
 
 def decode_action(action: np.ndarray, game_state: GameState) -> Tuple[dict, bool]:
     """
@@ -80,12 +108,16 @@ def decode_action(action: np.ndarray, game_state: GameState) -> Tuple[dict, bool
     # 3. ROUND_EVAL State
     elif state_name == "ROUND_EVAL":
         return {"action": "cash_out"}, True
-            
-    # 4. SHOP State
+    
+    # 4. SHOP State — Phase 2: full shop interaction
     elif state_name == "SHOP":
-        return {"action": "next_round"}, True
+        return _decode_shop_action(action_type, card_mask, game_state)
+    
+    # 5. BOOSTER PACK States — Phase 2: agent-driven booster interaction
+    elif state_name in BOOSTER_STATES:
+        return _decode_booster_action(action_type, card_mask, game_state)
             
-    # 5. Other / Menu / Game Over
+    # 6. Other / Menu / Game Over
     elif state_name == "MENU" or state_name == "GAME_OVER":
         if state_name == "MENU":
             return {"action": "start_game", "deck": "RED", "stake": "WHITE"}, True
@@ -93,3 +125,79 @@ def decode_action(action: np.ndarray, game_state: GameState) -> Tuple[dict, bool
             return {"action": "menu"}, True
             
     return {"action": "wait"}, True
+
+
+def _decode_shop_action(action_type: int, card_mask: np.ndarray, game_state: GameState) -> Tuple[dict, bool]:
+    """Decode actions when in SHOP state.
+    
+    Valid action types: 6 (buy card), 7 (buy voucher), 8 (buy pack),
+    9 (reroll), 10 (sell joker), 5 (next_round).
+    All other types default to next_round.
+    """
+    money = float(game_state.money)
+    
+    if action_type == 6:  # BUY_CARD
+        idx = _first_set_bit(card_mask, max_idx=1)  # shop has max ~2 cards
+        if game_state.shop and game_state.shop.cards and idx < len(game_state.shop.cards):
+            buy_cost = game_state.shop.cards[idx].cost.buy
+            if money >= buy_cost:
+                return {"action": "buy_card", "index": idx}, True
+        return {"action": "next_round"}, True
+    
+    elif action_type == 7:  # BUY_VOUCHER
+        idx = _first_set_bit(card_mask, max_idx=1)
+        if game_state.vouchers and game_state.vouchers.cards and idx < len(game_state.vouchers.cards):
+            buy_cost = game_state.vouchers.cards[idx].cost.buy
+            if money >= buy_cost:
+                return {"action": "buy_voucher", "index": idx}, True
+        return {"action": "next_round"}, True
+    
+    elif action_type == 8:  # BUY_PACK
+        idx = _first_set_bit(card_mask, max_idx=1)
+        if game_state.packs and game_state.packs.cards and idx < len(game_state.packs.cards):
+            buy_cost = game_state.packs.cards[idx].cost.buy
+            if money >= buy_cost:
+                return {"action": "buy_pack", "index": idx}, True
+        return {"action": "next_round"}, True
+    
+    elif action_type == 9:  # REROLL
+        reroll_cost = game_state.round.reroll_cost
+        if money >= reroll_cost:
+            return {"action": "reroll"}, True
+        return {"action": "next_round"}, True
+    
+    elif action_type == 10:  # SELL_JOKER
+        idx = _first_set_bit(card_mask, max_idx=4)  # max 5 joker slots
+        if game_state.jokers and game_state.jokers.cards and idx < len(game_state.jokers.cards):
+            # Don't sell eternal jokers
+            joker = game_state.jokers.cards[idx]
+            if not joker.modifier.eternal:
+                return {"action": "sell_joker", "index": idx}, True
+        return {"action": "next_round"}, True
+    
+    else:
+        # action_type 5 (NEXT_ROUND) or any other → leave shop
+        return {"action": "next_round"}, True
+
+
+def _decode_booster_action(action_type: int, card_mask: np.ndarray, game_state: GameState) -> Tuple[dict, bool]:
+    """Decode actions when a booster pack is opened.
+    
+    Valid action types: 11 (pack_select), 12 (pack_skip).
+    All other types default to pack_skip for safety.
+    """
+    if not game_state.pack or not game_state.pack.cards:
+        # No pack cards available — skip
+        return {"action": "pack_skip"}, True
+    
+    if action_type == 11:  # PACK_SELECT
+        idx = _first_set_bit(card_mask, max_idx=4)  # up to 5 cards in pack
+        if idx < len(game_state.pack.cards):
+            return {"action": "pack_select", "index": idx}, True
+        else:
+            # Index out of range, select first card
+            return {"action": "pack_select", "index": 0}, True
+    
+    else:
+        # action_type 12 (PACK_SKIP) or any other → skip
+        return {"action": "pack_skip"}, True

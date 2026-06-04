@@ -19,6 +19,8 @@ def main():
     parser.add_argument("--ent-coef", type=float, default=None, help="Override entropy coefficient.")
     parser.add_argument("--resume", type=str, default=None, help="Path to a saved PPO model to resume training from.")
     parser.add_argument("--device", type=str, default=None, help="Override target device (cpu/cuda/auto).")
+    parser.add_argument("--deck", type=str, default="YELLOW", help="Deck to use for training (RED, BLUE, YELLOW, GREEN, etc.). Default: YELLOW.")
+    parser.add_argument("--stake", type=str, default="WHITE", help="Stake level for training. Default: WHITE.")
     args = parser.parse_args()
 
     # 1. Setup logging
@@ -74,6 +76,10 @@ def main():
     logger.info(f"Active Balatro instance(s) detected: {api_urls}")
 
     # Helper function to create an env with logging configured
+    deck = args.deck
+    stake = args.stake
+    logger.info(f"Training with deck={deck}, stake={stake}")
+
     def make_env(url):
         def _init():
             # Ensure logging is configured in subprocess workers
@@ -84,7 +90,7 @@ def main():
                     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
                     handlers=[_logging.StreamHandler()],
                 )
-            return Monitor(BalatroEnv(base_url=url))
+            return Monitor(BalatroEnv(base_url=url, deck=deck, stake=stake))
         return _init
 
     if len(api_urls) > 1:
@@ -96,7 +102,7 @@ def main():
         logger.info("Initializing DummyVecEnv for a single environment.")
         # Ensure we can connect to the single instance before proceeding
         try:
-            temp_env = BalatroEnv(base_url=api_urls[0])
+            temp_env = BalatroEnv(base_url=api_urls[0], deck=deck, stake=stake)
             health = temp_env.client.health()
             logger.info(f"API Connection established on {api_urls[0]}. Health check: {health}")
         except Exception as e:

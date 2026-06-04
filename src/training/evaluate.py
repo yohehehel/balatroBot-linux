@@ -21,6 +21,13 @@ def api_to_gym_action(api_decision, game_state) -> np.ndarray:
         "skip_blind": 3,
         "cash_out": 4,
         "next_round": 5,
+        "buy_card": 6,
+        "buy_voucher": 7,
+        "buy_pack": 8,
+        "reroll": 9,
+        "sell_joker": 10,
+        "pack_select": 11,
+        "pack_skip": 12,
         "menu": 4,         # GAME_OVER -> returns to menu (action 4)
         "start_game": 5,   # MENU -> starts game (action 5)
     }

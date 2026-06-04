@@ -7,16 +7,23 @@ from typing import Dict, Any, Tuple, Optional
 from src.client import BalatroClient, BalatroAPIError
 from src.game_state import GameState
 from src.env.observation import get_observation_space, encode_observation
-from src.env.action import get_action_space, decode_action
+from src.env.action import get_action_space, decode_action, BOOSTER_STATES
 
 logger = logging.getLogger("BalatroEnv")
+
+# Maximum number of shop actions per visit before forcing next_round
+MAX_SHOP_ACTIONS = 20
+
 
 class BalatroEnv(gym.Env):
     metadata = {"render_modes": []}
 
-    def __init__(self, base_url: str = "http://127.0.0.1:12346", timeout: float = 30.0):
+    def __init__(self, base_url: str = "http://127.0.0.1:12346", timeout: float = 30.0,
+                 deck: str = "YELLOW", stake: str = "WHITE"):
         super().__init__()
         self.client = BalatroClient(base_url=base_url, timeout=timeout)
+        self.deck = deck
+        self.stake = stake
         
         # Define spaces
         self.observation_space = get_observation_space()
@@ -28,29 +35,27 @@ class BalatroEnv(gym.Env):
         self.max_invalid_actions = 20
         self._step_count = 0
         self._env_id = base_url.split(":")[-1]  # port number for logging
+        
+        # Phase 2: shop action counter to prevent infinite shop loops
+        self._shop_actions_taken = 0
 
     def _auto_skip_boosters(self, state: GameState) -> GameState:
-        """Automatically skip booster pack selection to prevent the environment from getting stuck.
+        """Fallback: automatically skip booster pack selection if the agent
+        can't handle it (e.g. unexpected booster during non-booster states).
+        
+        In Phase 2, this is only called as a safety net after certain actions
+        (blind select, cash_out) — not after buy_pack, where the agent drives
+        the booster interaction directly.
         
         Handles timing race conditions where the pack may have already auto-closed
         between the time the gamestate was reported and the time we call pack(skip=True).
         """
-        booster_states = {
-            "SMODS_BOOSTER_OPENED",
-            "TAROT_PACK",
-            "PLANET_PACK",
-            "SPECTRAL_PACK",
-            "STANDARD_PACK",
-            "BUFFOON_PACK",
-        }
         max_retries = 5
         retries = 0
-        while state.state in booster_states and retries < max_retries:
+        while state.state in BOOSTER_STATES and retries < max_retries:
             retries += 1
 
             # Verify pack is actually present in gamestate data.
-            # With fast game speed, the pack may have already auto-closed
-            # even though the state name still indicates a booster state.
             if not state.pack or not state.pack.cards:
                 logger.info(
                     f"Booster state '{state.state}' reported but no pack cards "
@@ -71,8 +76,6 @@ class BalatroEnv(gym.Env):
                 state = self.client.pack(skip=True)
             except BalatroAPIError as e:
                 if e.data and isinstance(e.data, dict) and e.data.get("name") == "INVALID_STATE":
-                    # Pack already closed between state check and API call (race condition).
-                    # Refresh gamestate and let the while loop re-evaluate.
                     logger.warning(
                         f"Pack already closed (INVALID_STATE). Refreshing gamestate..."
                     )
@@ -93,6 +96,7 @@ class BalatroEnv(gym.Env):
         super().reset(seed=seed)
         self.invalid_actions_in_a_row = 0
         self._step_count = 0
+        self._shop_actions_taken = 0
         
         max_attempts = 3
         for attempt in range(1, max_attempts + 1):
@@ -109,9 +113,9 @@ class BalatroEnv(gym.Env):
                 if state.state != "MENU":
                     raise RuntimeError(f"Expected game state to be MENU, but got {state.state}")
                 
-                # Start a new run (RED deck, WHITE stake)
-                logger.info("Starting new run (RED deck, WHITE stake)...")
-                state = self.client.start(deck="RED", stake="WHITE")
+                # Start a new run
+                logger.info(f"Starting new run ({self.deck} deck, {self.stake} stake)...")
+                state = self.client.start(deck=self.deck, stake=self.stake)
                 
                 # Handle any booster screens (if any auto-opens on startup, unlikely but safe)
                 state = self._auto_skip_boosters(state)
@@ -160,26 +164,21 @@ class BalatroEnv(gym.Env):
         else:
             self.invalid_actions_in_a_row = 0
             
+            # Track shop actions to prevent infinite loops
+            if state.state == "SHOP" and action_type != "next_round":
+                self._shop_actions_taken += 1
+                if self._shop_actions_taken >= MAX_SHOP_ACTIONS:
+                    logger.info(f"Shop action limit reached ({MAX_SHOP_ACTIONS}). Forcing next_round.")
+                    action_type = "next_round"
+                    action_dict = {"action": "next_round"}
+            
+            # Reset shop counter when leaving shop
+            if action_type == "next_round" and state.state == "SHOP":
+                self._shop_actions_taken = 0
+            
             # Execute action
             try:
-                if action_type == "play":
-                    new_state = self.client.play(action_dict["cards"])
-                elif action_type == "discard":
-                    new_state = self.client.discard(action_dict["cards"])
-                elif action_type == "select_blind":
-                    new_state = self.client.select()
-                elif action_type == "skip_blind":
-                    new_state = self.client.skip()
-                elif action_type == "cash_out":
-                    new_state = self.client.cash_out()
-                elif action_type == "next_round":
-                    new_state = self.client.next_round()
-                elif action_type == "start_game":
-                    new_state = self.client.start(deck="RED", stake="WHITE")
-                elif action_type == "menu":
-                    new_state = self.client.menu()
-                else:
-                    new_state = state
+                new_state = self._execute_action(action_type, action_dict, state)
             except BalatroAPIError as e:
                 logger.error(f"API Error during step execution: {e}. Attempting to recover state...")
                 reward = -0.5
@@ -199,8 +198,10 @@ class BalatroEnv(gym.Env):
                     logger.error(f"Failed to recover state: {recovery_err}")
                     new_state = state
                 
-            # Post-action processing: handle booster pack screen
-            new_state = self._auto_skip_boosters(new_state)
+            # Post-action processing: auto-skip boosters ONLY as fallback
+            # (not after buy_pack or pack actions, where the agent drives interaction)
+            if action_type not in ("buy_pack", "pack_select", "pack_skip"):
+                new_state = self._auto_skip_boosters(new_state)
             
             # Calculate reward
             reward = self._calculate_reward(state, new_state)
@@ -231,6 +232,43 @@ class BalatroEnv(gym.Env):
             
         return obs, reward, terminated, truncated, info
 
+    def _execute_action(self, action_type: str, action_dict: dict, state: GameState) -> GameState:
+        """Execute a decoded action against the Balatro API and return the new state."""
+        if action_type == "play":
+            return self.client.play(action_dict["cards"])
+        elif action_type == "discard":
+            return self.client.discard(action_dict["cards"])
+        elif action_type == "select_blind":
+            return self.client.select()
+        elif action_type == "skip_blind":
+            return self.client.skip()
+        elif action_type == "cash_out":
+            return self.client.cash_out()
+        elif action_type == "next_round":
+            return self.client.next_round()
+        elif action_type == "start_game":
+            return self.client.start(deck=self.deck, stake=self.stake)
+        elif action_type == "menu":
+            return self.client.menu()
+        # Phase 2: Shop actions
+        elif action_type == "buy_card":
+            return self.client.buy(card=action_dict["index"])
+        elif action_type == "buy_voucher":
+            return self.client.buy(voucher=action_dict["index"])
+        elif action_type == "buy_pack":
+            return self.client.buy(pack=action_dict["index"])
+        elif action_type == "reroll":
+            return self.client.reroll()
+        elif action_type == "sell_joker":
+            return self.client.sell(joker=action_dict["index"])
+        # Phase 2: Booster pack actions
+        elif action_type == "pack_select":
+            return self.client.pack(card=action_dict.get("index", 0))
+        elif action_type == "pack_skip":
+            return self.client.pack(skip=True)
+        else:
+            return state
+
     def _calculate_reward(self, old_state: GameState, new_state: GameState) -> float:
         reward = 0.0
         
@@ -258,11 +296,26 @@ class BalatroEnv(gym.Env):
             reward += 5.0 * (int(new_state.ante_num) - int(old_state.ante_num))
             logger.info(f"Ante increased from {old_state.ante_num} to {new_state.ante_num}! +5.0 Reward.")
 
-        # 4. Money accumulation (Encourage earning money, but do not penalize spending)
-        if float(new_state.money) > float(old_state.money):
-            reward += 0.1 * (float(new_state.money) - float(old_state.money))
+        # 4. Money change — balanced reward that allows spending
+        money_delta = float(new_state.money) - float(old_state.money)
+        reward += 0.05 * money_delta
 
-        # 5. Game end conditions
+        # 5. Interest threshold bonus — reward for maintaining money at interest levels
+        # Applied when transitioning to a new phase where interest matters
+        if (old_state.state in ("ROUND_EVAL", "SELECTING_HAND") and 
+            new_state.state in ("SHOP", "BLIND_SELECT")):
+            interest = min(int(new_state.money) // 5, 5)
+            if interest > 0:
+                reward += 0.3 * interest  # max +1.5 for maintaining $25+
+        
+        # 6. Joker acquisition — reward for gaining jokers
+        old_joker_count = len(old_state.jokers.cards) if old_state.jokers else 0
+        new_joker_count = len(new_state.jokers.cards) if new_state.jokers else 0
+        if new_joker_count > old_joker_count:
+            reward += 0.5 * (new_joker_count - old_joker_count)
+            logger.debug(f"Joker acquired! {old_joker_count} -> {new_joker_count}")
+
+        # 7. Game end conditions
         if new_state.state == "GAME_OVER":
             if new_state.won:
                 reward += 10.0

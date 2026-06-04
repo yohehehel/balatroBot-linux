@@ -10,7 +10,7 @@ class TrainingConfig:
     n_epochs: int = 10
     gamma: float = 0.99
     clip_range: float = 0.2
-    ent_coef: float = 0.005
+    ent_coef: float = 0.01
     
     # Training Loop Settings
     total_timesteps: int = 200_000
