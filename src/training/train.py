@@ -2,10 +2,16 @@ import os
 import sys
 import argparse
 import logging
+import torch
+
+# Limit PyTorch CPU threads to avoid CPU thrashing on high-core VMs
+torch.set_num_threads(1)
+torch.set_num_interop_threads(1)
+
 from stable_baselines3 import PPO
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
-from stable_baselines3.common.callbacks import CheckpointCallback, CallbackList
+from stable_baselines3.common.callbacks import CallbackList
 
 from src.env.balatro_env import BalatroEnv
 from src.training.config import TrainingConfig
@@ -21,15 +27,17 @@ def main():
     parser.add_argument("--device", type=str, default=None, help="Override target device (cpu/cuda/auto).")
     parser.add_argument("--deck", type=str, default="YELLOW", help="Deck to use for training (RED, BLUE, YELLOW, GREEN, etc.). Default: YELLOW.")
     parser.add_argument("--stake", type=str, default="WHITE", help="Stake level for training. Default: WHITE.")
+    parser.add_argument("--num-instances", type=int, default=1, help="Number of parallel Balatro instances.")
     args = parser.parse_args()
 
-    # 1. Setup logging
+    # 1. Setup logging (root is WARNING, main trainer logger is INFO)
     logging.basicConfig(
-        level=logging.INFO,
+        level=logging.WARNING,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         handlers=[logging.StreamHandler(sys.stdout)]
     )
     logger = logging.getLogger("TrainPPO")
+    logger.setLevel(logging.INFO)
 
     # 2. Load configuration
     config = TrainingConfig()
@@ -42,7 +50,21 @@ def main():
     if args.device is not None:
         config.device = args.device
 
-    # Ensure output directories exist
+    # Ensure output directories exist and clean up old logs/models if starting fresh
+    if not args.resume:
+        logger.info("Fresh run detected. Cleaning up old logs and checkpoints...")
+        import shutil
+        if os.path.exists(config.log_dir):
+            try:
+                shutil.rmtree(config.log_dir)
+            except Exception as e:
+                logger.warning(f"Could not clear logs directory: {e}")
+        if os.path.exists(config.model_dir):
+            try:
+                shutil.rmtree(config.model_dir)
+            except Exception as e:
+                logger.warning(f"Could not clear models directory: {e}")
+
     os.makedirs(config.log_dir, exist_ok=True)
     os.makedirs(config.model_dir, exist_ok=True)
 
@@ -55,10 +77,10 @@ def main():
     if args.api_url != "http://127.0.0.1:12346":
         api_urls = [args.api_url]
     else:
-        logger.info("Scanning for active Balatro API instances on ports 12346-12353...")
+        logger.info(f"Scanning for active Balatro API instances on ports 12346-{12346 + args.num_instances - 1}...")
         import httpx
         base_port = 12346
-        for p in range(base_port, base_port + 8):
+        for p in range(base_port, base_port + args.num_instances):
             url = f"http://127.0.0.1:{p}"
             try:
                 # We use a short timeout so scanning doesn't take too long.
@@ -82,20 +104,24 @@ def main():
 
     def make_env(url):
         def _init():
-            # Ensure logging is configured in subprocess workers
+            # Configure logging in subprocess workers to be quiet (WARNING level)
             import logging as _logging
             if not _logging.getLogger().handlers:
                 _logging.basicConfig(
-                    level=_logging.INFO,
+                    level=_logging.WARNING,
                     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
                     handlers=[_logging.StreamHandler()],
                 )
+            else:
+                _logging.getLogger().setLevel(_logging.WARNING)
+            _logging.getLogger("BalatroEnv").setLevel(_logging.WARNING)
+            _logging.getLogger("BalatroClient").setLevel(_logging.WARNING)
+            _logging.getLogger("httpx").setLevel(_logging.WARNING)
             return Monitor(BalatroEnv(base_url=url, deck=deck, stake=stake))
         return _init
 
     if len(api_urls) > 1:
         # Use SubprocVecEnv for true parallelism across processes.
-        # Note: env logs are configured in _init() above so they show in subprocess stderr.
         logger.info(f"Initializing SubprocVecEnv with {len(api_urls)} parallel environments...")
         env = SubprocVecEnv([make_env(url) for url in api_urls])
     else:
@@ -120,6 +146,7 @@ def main():
             device=config.device,
             tensorboard_log=config.log_dir,
         )
+        model.verbose = 0
         # Update hyperparameters if overridden
         if args.learning_rate is not None:
             model.learning_rate = args.learning_rate
@@ -131,7 +158,7 @@ def main():
         model = PPO(
             "MultiInputPolicy",
             env,
-            verbose=1,
+            verbose=0,
             tensorboard_log=config.log_dir,
             **ppo_kwargs
         )
@@ -139,13 +166,11 @@ def main():
     logger.info(f"Using device: {model.device}")
 
     # 5. Set up callbacks
-    checkpoint_callback = CheckpointCallback(
+    metrics_callback = BalatroMetricsCallback(
         save_freq=max(1, config.save_freq),
-        save_path=config.model_dir,
-        name_prefix="ppo_balatro"
+        model_dir=config.model_dir
     )
-    metrics_callback = BalatroMetricsCallback()
-    callbacks = CallbackList([checkpoint_callback, metrics_callback])
+    callbacks = CallbackList([metrics_callback])
 
     # 6. Start training
     logger.info(f"Starting training loop for {config.total_timesteps} steps...")

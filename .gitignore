@@ -2,3 +2,6 @@ Balatro.v1.0.0i/
 .venv/
 __pycache__/
 scratch/
+models/
+logs/
+.pytest_cache/

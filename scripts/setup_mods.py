@@ -6,8 +6,44 @@ import sys
 from pathlib import Path
 
 # Paths configuration
-BALATRO_DIR = Path(r"c:\Users\Thomas\Desktop\python\balatroBot\Balatro.v1.0.0i")
-APPDATA_DIR = Path(os.environ.get("APPDATA", r"C:\Users\Thomas\AppData\Roaming"))
+REPO_ROOT = Path(__file__).resolve().parent.parent
+BALATRO_DIR = REPO_ROOT / "Balatro.v1.0.0i"
+
+if sys.platform == "linux":
+    # Under Linux, resolve Wine prefix AppData path
+    import subprocess
+    wineprefix = os.environ.get("WINEPREFIX", os.path.expanduser("~/.wine"))
+    drive_c = Path(wineprefix) / "drive_c"
+    
+    # Initialize WinePrefix if users directory does not exist yet
+    if not (drive_c / "users").exists():
+        print(f"Initializing Wine prefix at {wineprefix}...")
+        env = os.environ.copy()
+        env["WINEPREFIX"] = wineprefix
+        env["WINEDEBUG"] = "-all"
+        subprocess.run(["wineboot", "-u"], env=env, check=True)
+        
+    users_dir = drive_c / "users"
+    appdata_dir = None
+    for p in users_dir.iterdir():
+        if p.is_dir() and p.name not in (".", ".."):
+            candidate = p / "AppData" / "Roaming"
+            if candidate.exists():
+                appdata_dir = candidate
+                break
+            candidate_alt = p / "Application Data"
+            if candidate_alt.exists():
+                appdata_dir = candidate_alt
+                break
+                
+    if not appdata_dir:
+        username = os.environ.get("USER", "steamuser")
+        appdata_dir = users_dir / username / "AppData" / "Roaming"
+        
+    APPDATA_DIR = appdata_dir
+else:
+    APPDATA_DIR = Path(os.environ.get("APPDATA", r"C:\Users\Thomas\AppData\Roaming"))
+
 BALATRO_APPDATA = APPDATA_DIR / "Balatro"
 MODS_DIR = BALATRO_APPDATA / "Mods"
 
@@ -260,6 +296,37 @@ def setup_balatrobot_mod():
         if src_lua_src.exists():
             shutil.copytree(src_lua_src, bot_mod_dir / "src")
 
+        # Patch settings.lua for speed hack and FPS cap
+        settings_lua_path = bot_mod_dir / "src" / "lua" / "settings.lua"
+        if settings_lua_path.exists():
+            print("Applying BalatroBot settings.lua speed hack patch...")
+            content = settings_lua_path.read_text(encoding="utf-8").replace('\r\n', '\n')
+            
+            # Replace configure_love_update delta time
+            old_update = 'local dt = BB_SETTINGS.headless and (4.99 / 60.0) or (1.0 / 60.0)'
+            new_update = 'local dt = BB_SETTINGS.headless and (49.9 / 60.0) or (10.0 / 60.0) -- 10x Speed Hack'
+            content = content.replace(old_update, new_update)
+            
+            # Replace configure_fast to support G.SETTINGS.GAMESPEED = 100.0 and FPS throttling
+            old_fast = """local function configure_fast()
+  -- performance
+  G.FPS_CAP = nil -- Unlimited FPS
+  G.SETTINGS.GAMESPEED = 10 -- 10x game speed
+  G.ANIMATION_FPS = 60 -- 6x faster animations
+  G.F_VERBOSE = false
+end""".replace('\r\n', '\n')
+            new_fast = """local function configure_fast()
+  -- performance
+  G.FPS_CAP = BB_SETTINGS.fps_cap or 250 -- VSync throttling
+  G.SETTINGS.GAMESPEED = 100.0 -- 100x speed hack
+  G.SETTINGS.gamespeed = 100.0
+  G.ANIMATION_FPS = 600
+  G.F_VERBOSE = false
+end""".replace('\r\n', '\n')
+            content = content.replace(old_fast, new_fast)
+            settings_lua_path.write_text(content, encoding="utf-8")
+            print("settings.lua patched successfully.")
+
         # Patch start.lua for clean resets and clearing unlock events
         start_lua_path = bot_mod_dir / "src" / "lua" / "endpoints" / "start.lua"
         if start_lua_path.exists():
@@ -272,16 +339,202 @@ def setup_balatrobot_mod():
                 start_lua_path.write_text(content, encoding="utf-8")
                 print("start.lua patched successfully.")
 
-        # Patch balatrobot.lua to override create_unlock_overlay and bypass unlock popups
+         # Patch balatrobot.lua to override create_unlock_overlay, bypass unlock popups, and disable rendering
         balatrobot_lua_path = bot_mod_dir / "balatrobot.lua"
         if balatrobot_lua_path.exists():
             print("Applying BalatroBot balatrobot.lua bypass patch...")
             content = balatrobot_lua_path.read_text(encoding="utf-8")
-            bypass_code = "\n-- Bypass unlock popups to prevent the game/API from hanging during automated bot training\nlocal original_create_unlock_overlay = create_unlock_overlay\ncreate_unlock_overlay = function(key)\n  sendInfoMessage(\"Bypassing unlock overlay popup for key: \" .. tostring(key), \"BB.MOD\")\nend\n"
+            bypass_code = """
+-- Bypass unlock popups to prevent the game/API from hanging during automated bot training
+local original_create_unlock_overlay = create_unlock_overlay
+create_unlock_overlay = function(key)
+  sendInfoMessage("Bypassing unlock overlay popup for key: " .. tostring(key), "BB.MOD")
+end
+
+-- Force Love2D à ignorer la perte de focus sous Xvfb
+if love.window then
+  love.window.hasFocus = function() return true end
+  love.window.isMinimized = function() return false end
+  love.window.isVisible = function() return true end
+end
+
+-- Désactive l'exécution du pipeline de dessin
+love.draw = function() end
+
+-- Court-circuite la présentation de la frame à l'écran virtuel
+love.graphics.present = function() end
+
+-- Optionnel : force le moteur à ignorer la création de fenêtre si possible
+love.conf = function(t)
+    t.window = false
+end
+
+-- Force VSync off always
+if love.window then
+    local old_setMode = love.window.setMode
+    love.window.setMode = function(width, height, flags)
+        if flags then flags.vsync = 0 end
+        return old_setMode(width, height, flags)
+    end
+
+    local old_updateMode = love.window.updateMode
+    love.window.updateMode = function(width, height, flags)
+        if flags then flags.vsync = 0 end
+        return old_updateMode(width, height, flags)
+    end
+end
+
+-- Mock love.audio and disable sound/music functions to prevent Wine/OpenAL hanging on headless Linux
+if love.audio then
+  love.audio.play = function() end
+  love.audio.stop = function() end
+  love.audio.pause = function() end
+  love.audio.newSource = function()
+    local mock_source = {}
+    mock_source.play = function() end
+    mock_source.stop = function() end
+    mock_source.setVolume = function() end
+    mock_source.setPitch = function() end
+    mock_source.isPlaying = function() return false end
+    mock_source.release = function() end
+    mock_source.setLooping = function() end
+    mock_source.isLooping = function() return false end
+    mock_source.clone = function() return mock_source end
+    return mock_source
+  end
+end
+
+-- Override global audio triggers
+play_sound = function() end
+PLAY_SOUND = function() return { sound = love.audio.newSource() } end
+
+
+-- Hook into love.update to force gamespeed, apply cash_out fallback, and force instant Moveable updates
+local original_love_update = love.update
+local cash_out_hooked = false
+local moveable_hooked = false
+love.update = function(dt)
+  if G and G.SETTINGS then
+    G.SETTINGS.gamespeed = 100.0
+    G.SETTINGS.GAMESPEED = 100.0
+  end
+  if G and G.FUNCS and G.FUNCS.cash_out and not cash_out_hooked then
+    local original_cash_out = G.FUNCS.cash_out
+    G.FUNCS.cash_out = function(e)
+      if not G.round_eval then
+        sendInfoMessage("G.round_eval is nil during cash_out, creating dummy to allow state transition", "BB.MOD")
+        G.round_eval = {
+          alignment = { offset = {} },
+          remove = function() end
+        }
+      end
+      original_cash_out(e)
+    end
+    cash_out_hooked = true
+  end
+  if Moveable and not moveable_hooked then
+    local original_move_xy = Moveable.move_xy
+    Moveable.move_xy = function(self, dt_param)
+      if BB_SETTINGS and BB_SETTINGS.headless then
+        self.VT.x = self.T.x
+        self.VT.y = self.T.y
+        self.velocity.x = 0
+        self.velocity.y = 0
+      else
+        original_move_xy(self, dt_param)
+      end
+    end
+
+    local original_move_scale = Moveable.move_scale
+    Moveable.move_scale = function(self, dt_param)
+      if BB_SETTINGS and BB_SETTINGS.headless then
+        self.VT.scale = self.T.scale
+        self.velocity.scale = 0
+      else
+        original_move_scale(self, dt_param)
+      end
+    end
+
+    local original_move_r = Moveable.move_r
+    Moveable.move_r = function(self, dt_param, vel)
+      if BB_SETTINGS and BB_SETTINGS.headless then
+        self.VT.r = self.T.r
+        self.velocity.r = 0
+      else
+        original_move_r(self, dt_param, vel)
+      end
+    end
+
+    moveable_hooked = true
+  end
+  original_love_update(dt)
+end
+
+-- Hook EventManager:update to multiply delta time by 10x for resolving animations instantly
+if EventManager then
+  local old_event_update = EventManager.update
+  EventManager.update = function(self, dt, forced)
+    return old_event_update(self, dt * 10.0, forced)
+  end
+end
+"""
             if "Bypassing unlock overlay popup" not in content:
                 content = content + bypass_code
                 balatrobot_lua_path.write_text(content, encoding="utf-8")
                 print("balatrobot.lua patched successfully.")
+
+        # Create Lovely .toml patch to fix fresh Wine prefix crashes.
+        # This injects code directly into game.lua at source level (before any Lua runs),
+        # so it cannot be overwritten by Steamodded at runtime.
+        # Fixes: game.lua:1509: attempt to index field 'tutorial_progress' (a nil value)
+        lovely_patch_dir = bot_mod_dir / "lovely"
+        lovely_patch_dir.mkdir(parents=True, exist_ok=True)
+        fresh_prefix_toml = lovely_patch_dir / "fresh_prefix_fix.toml"
+        fresh_prefix_toml.write_text('''[manifest]
+version = "1.0.0"
+dump_lua = true
+priority = -1
+
+# Fresh Wine prefix fix: initialize G.SETTINGS.tutorial_progress early
+# in Game:start_up(), before any code accesses it.
+# The old approach tried to match 'function Game:main_menu(change_context)'
+# but that line has a trailing comment in v1.0.0i, causing the pattern to fail.
+
+# Patch 1: Initialize tutorial_progress before set_profile_progress() in Game:start_up()
+[[patches]]
+[patches.pattern]
+target = "game.lua"
+pattern = "set_profile_progress()"
+position = "before"
+match_indent = true
+payload = """
+    -- [BalatroBot] Guard for fresh Wine prefix with no saved profile
+    if not G.SETTINGS.tutorial_progress then
+        G.SETTINGS.tutorial_progress = {completed_parts = {}, hold_parts = {}}
+    end
+    if not G.SETTINGS.tutorial_complete then
+        G.SETTINGS.tutorial_complete = false
+    end"""
+
+# Patch 2: Nil-guard the tutorial_progress access in Game:main_menu (line ~1480)
+[[patches]]
+[patches.pattern]
+target = "game.lua"
+pattern = "if (not G.SETTINGS.tutorial_complete) and G.SETTINGS.tutorial_progress.completed_parts['big_blind'] then G.SETTINGS.tutorial_complete = true end"
+position = "at"
+match_indent = true
+payload = "if (not G.SETTINGS.tutorial_complete) and G.SETTINGS.tutorial_progress and G.SETTINGS.tutorial_progress.completed_parts and G.SETTINGS.tutorial_progress.completed_parts['big_blind'] then G.SETTINGS.tutorial_complete = true end"
+
+# Patch 3: Nil-guard the tutorial_progress access in Game:start_run (line ~2113)
+[[patches]]
+[patches.pattern]
+target = "game.lua"
+pattern = """self.GAME.pseudorandom.seed = args.seed or (not (G.SETTINGS.tutorial_complete or G.SETTINGS.tutorial_progress.completed_parts['big_blind']) and "TUTORIAL") or random_string(8, G.CONTROLLER.cursor_hover.T.x*0.33411983 + G.CONTROLLER.cursor_hover.T.y*0.874146 + 0.412311010*G.CONTROLLER.cursor_hover.time)"""
+position = "at"
+match_indent = true
+payload = """self.GAME.pseudorandom.seed = args.seed or (not (G.SETTINGS.tutorial_complete or (G.SETTINGS.tutorial_progress and G.SETTINGS.tutorial_progress.completed_parts and G.SETTINGS.tutorial_progress.completed_parts['big_blind'])) and "TUTORIAL") or random_string(8, G.CONTROLLER.cursor_hover.T.x*0.33411983 + G.CONTROLLER.cursor_hover.T.y*0.874146 + 0.412311010*G.CONTROLLER.cursor_hover.time)"""
+''', encoding="utf-8")
+        print("Created Lovely patch: fresh_prefix_fix.toml")
             
         print("Mod BalatroBot Lua installé dans Mods/balatrobot.")
     except Exception as e:

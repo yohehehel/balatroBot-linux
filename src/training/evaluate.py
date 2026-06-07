@@ -3,6 +3,12 @@ import sys
 import argparse
 import logging
 import numpy as np
+import torch
+
+# Limit PyTorch CPU threads to avoid CPU thrashing on high-core VMs
+torch.set_num_threads(4)
+torch.set_num_interop_threads(4)
+
 from stable_baselines3 import PPO
 from stable_baselines3.common.monitor import Monitor
 
