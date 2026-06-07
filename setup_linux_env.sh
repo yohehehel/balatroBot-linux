@@ -31,13 +31,13 @@ echo "[3/3] Installing Python dependencies..."
 if command -v uv &> /dev/null; then
     echo "  uv package manager detected. Using 'uv pip' for fast installation..."
     uv pip install --upgrade pip
-    uv pip install torch --index-url https://download.pytorch.org/whl/cpu
+    uv pip install torch --index-url https://download.pytorch.org/whl/cu121
     uv pip install -e .
     uv pip install tensorboard
 else
     echo "  Using standard pip..."
     pip install --upgrade pip
-    pip install torch --index-url https://download.pytorch.org/whl/cpu
+    pip install torch --index-url https://download.pytorch.org/whl/cu121
     pip install -e .
     pip install tensorboard
 fi
